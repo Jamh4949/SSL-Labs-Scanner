@@ -106,3 +106,9 @@ debug
 debug.exe
 __debug_bin
 __debug_bin.exe
+
+## -----------------------------------------------------------------------------
+# Documentación generada automáticamente
+# ------------------------------------------------------------------------------
+PLAN_ESTUDIO.md
+GUIA_RESPUESTAS.md

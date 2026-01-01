@@ -1,4 +1,8 @@
-// Package client proporciona el cliente HTTP para la API de SSL Labs v4
+// Package client provides an HTTP client for the SSL Labs API v4.
+// It handles authentication, rate limiting, retries with exponential backoff,
+// and proper context cancellation for graceful shutdown.
+//
+// Reference: https://github.com/ssllabs/ssllabs-scan/blob/master/ssllabs-api-docs-v4.md
 package client
 
 import (
@@ -19,67 +23,81 @@ import (
 	"ssllabs-scanner/models"
 )
 
+// Configuration constants for the SSL Labs API client.
 const (
-	// BaseURL es la URL base de la API de SSL Labs v4
+	// BaseURL is the base URL for SSL Labs API v4.
 	BaseURL = "https://api.ssllabs.com/api/v4"
 
-	// Version de la herramienta para User-Agent
+	// Version is the client version used in User-Agent header.
 	Version = "1.0.0"
 
-	// Intervalos de polling recomendados por la documentación
-	InitialPollInterval = 5 * time.Second  // Antes de IN_PROGRESS
-	ActivePollInterval  = 10 * time.Second // Durante IN_PROGRESS
+	// Polling intervals as recommended by the official documentation.
+	// Use shorter intervals before IN_PROGRESS, longer during active analysis.
+	InitialPollInterval = 5 * time.Second  // Before status becomes IN_PROGRESS
+	ActivePollInterval  = 10 * time.Second // During IN_PROGRESS status
 
-	// Reintentos para errores temporales
-	MaxRetries          = 3
-	MaxNetRetries       = 2               // Reintentos para errores de red transitorios
-	RetryJitterFraction = 0.2             // ±20% de variación aleatoria
-	NetRetryDelay       = 5 * time.Second // Delay base para errores de red
+	// Retry configuration for temporary errors.
+	MaxRetries          = 3               // Maximum HTTP retry attempts for 503/529 errors
+	MaxNetRetries       = 2               // Maximum retries for transient network errors
+	RetryJitterFraction = 0.2             // ±20% random variation to prevent thundering herd
+	NetRetryDelay       = 5 * time.Second // Base delay for network error retries
 
-	// Delays para reintentos HTTP (reducidos para demo; en producción usar 15min/30min según docs)
-	RetryDelay503 = 30 * time.Second // Producción: 15 * time.Minute
-	RetryDelay529 = 45 * time.Second // Producción: 30 * time.Minute
+	// Retry delays for specific HTTP error codes.
+	// NOTE: These are reduced for demo purposes. Production should use:
+	// - 503: 15 minutes (official recommendation)
+	// - 529: 30 minutes (official recommendation)
+	RetryDelay503 = 30 * time.Second // Service Unavailable retry delay
+	RetryDelay529 = 45 * time.Second // Overloaded retry delay
 
-	// Límite de tamaño de respuesta para evitar ataques de memoria
+	// MaxBodySize limits response body size to prevent memory exhaustion attacks.
+	// If a malicious server sends an infinite response, we stop reading at this limit.
 	MaxBodySize = 10 * 1024 * 1024 // 10 MB
 )
 
-// RateLimitInfo contiene información de límites de la API
+// RateLimitInfo contains rate limiting information from API response headers.
+// These values are extracted from X-Max-Assessments and X-Current-Assessments headers.
 type RateLimitInfo struct {
-	MaxAssessments     int
-	CurrentAssessments int
+	MaxAssessments     int // Maximum concurrent assessments allowed
+	CurrentAssessments int // Number of assessments currently in progress
 }
 
-// Client es el cliente para la API de SSL Labs
+// Client is the HTTP client for interacting with the SSL Labs API.
+// It is safe for concurrent use after initialization.
 type Client struct {
-	httpClient *http.Client
-	email      string
-	baseURL    string
-	userAgent  string
-	rng        *rand.Rand // Generador de números aleatorios con semilla propia
+	httpClient *http.Client // Underlying HTTP client with timeout and transport config
+	email      string       // Registered email for API authentication
+	baseURL    string       // API base URL (allows testing with mock servers)
+	userAgent  string       // User-Agent header value
 
-	// Protección para acceso concurrente a lastRateLimit
-	rlMu          sync.RWMutex
-	lastRateLimit RateLimitInfo
+	// rng is a dedicated random number generator with its own seed.
+	// Using a dedicated RNG avoids global state issues with math/rand in Go < 1.20.
+	rng *rand.Rand
+
+	// Thread-safe rate limit tracking.
+	// Uses RWMutex because reads are frequent but writes are rare.
+	rlMu          sync.RWMutex  // Protects lastRateLimit
+	lastRateLimit RateLimitInfo // Most recent rate limit info from API
 }
 
-// New crea un nuevo cliente de SSL Labs
+// New creates a new SSL Labs API client with the given registered email.
+// The email must be pre-registered with SSL Labs (see README.md).
 func New(email string) *Client {
-	// Crear generador de números aleatorios con semilla única
-	// (evita el problema de math/rand global sin semilla en Go < 1.20)
+	// Create a dedicated RNG with unique seed to avoid global state issues.
+	// This is important for jitter calculations in concurrent scenarios.
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
-	// Configurar Transport con soporte para proxy y conexiones reutilizables
+	// Configure HTTP transport with connection pooling and proxy support.
+	// ProxyFromEnvironment respects HTTP_PROXY and HTTPS_PROXY env vars.
 	transport := &http.Transport{
-		Proxy:             http.ProxyFromEnvironment,
-		MaxIdleConns:      10,
-		IdleConnTimeout:   30 * time.Second,
-		DisableKeepAlives: false,
+		Proxy:             http.ProxyFromEnvironment, // Support corporate proxies
+		MaxIdleConns:      10,                        // Connection pool size
+		IdleConnTimeout:   30 * time.Second,          // Cleanup idle connections
+		DisableKeepAlives: false,                     // Reuse connections for efficiency
 	}
 
 	return &Client{
 		httpClient: &http.Client{
-			Timeout:   60 * time.Second,
+			Timeout:   60 * time.Second, // Global timeout per request
 			Transport: transport,
 		},
 		email:     email,
@@ -89,14 +107,16 @@ func New(email string) *Client {
 	}
 }
 
-// GetRateLimitInfo devuelve la última información de rate limiting (thread-safe)
+// GetRateLimitInfo returns the most recent rate limiting information.
+// This method is thread-safe and can be called concurrently.
 func (c *Client) GetRateLimitInfo() RateLimitInfo {
 	c.rlMu.RLock()
 	defer c.rlMu.RUnlock()
 	return c.lastRateLimit
 }
 
-// updateRateLimit actualiza la información de rate limiting (thread-safe)
+// updateRateLimit updates the rate limiting information from response headers.
+// This method is thread-safe and uses exclusive locking for writes.
 func (c *Client) updateRateLimit(max, current int) {
 	c.rlMu.Lock()
 	defer c.rlMu.Unlock()
@@ -108,8 +128,9 @@ func (c *Client) updateRateLimit(max, current int) {
 	}
 }
 
-// ValidateEmail valida si el email es aceptable (no Gmail/Yahoo/Hotmail)
-// Nota: es heurístico; SSL Labs puede cambiar dominios bloqueados
+// ValidateEmail checks if the email is acceptable for SSL Labs registration.
+// SSL Labs blocks free email providers (Gmail, Yahoo, Hotmail, etc.).
+// Note: This is heuristic validation; SSL Labs may change blocked domains.
 func ValidateEmail(email string) (warnings []string) {
 	lower := strings.ToLower(email)
 	blockedDomains := []string{"@gmail.", "@yahoo.", "@hotmail.", "@outlook.com", "@live.com"}
@@ -117,26 +138,29 @@ func ValidateEmail(email string) (warnings []string) {
 	for _, domain := range blockedDomains {
 		if strings.Contains(lower, domain) {
 			warnings = append(warnings, fmt.Sprintf(
-				"⚠️  Advertencia: SSL Labs no permite emails de servicios gratuitos (%s). El registro puede fallar.",
+				"⚠️  Warning: SSL Labs does not allow emails from free services (%s). Registration may fail.",
 				domain))
 			break
 		}
 	}
 
 	if !strings.Contains(email, "@") {
-		warnings = append(warnings, "⚠️  Advertencia: El email no parece válido (falta @)")
+		warnings = append(warnings, "⚠️  Warning: Email appears invalid (missing @)")
 	}
 
 	return warnings
 }
 
-// APIError representa un error estructurado de la API
+// APIError represents a structured error response from the SSL Labs API.
+// It implements the error interface for seamless error handling.
 type APIError struct {
-	StatusCode int
-	RawBody    string
-	Errors     []models.ErrorDetail
+	StatusCode int                  // HTTP status code
+	RawBody    string               // Raw response body for debugging
+	Errors     []models.ErrorDetail // Parsed error details from JSON response
 }
 
+// Error implements the error interface.
+// It formats the error message including all error details if available.
 func (e *APIError) Error() string {
 	if len(e.Errors) > 0 {
 		var msgs []string
@@ -152,7 +176,8 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("error %d: %s", e.StatusCode, e.RawBody)
 }
 
-// sleepWithContext duerme respetando el contexto
+// sleepWithContext pauses execution for the specified duration while respecting
+// context cancellation. Returns ctx.Err() if the context is cancelled.
 func sleepWithContext(ctx context.Context, d time.Duration) error {
 	select {
 	case <-ctx.Done():
@@ -162,25 +187,29 @@ func sleepWithContext(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// addJitter añade variación aleatoria al delay (±20%)
+// addJitter adds random variation (±20%) to a delay duration.
+// This prevents the "thundering herd" problem where many clients
+// retry at exactly the same time after receiving the same error.
 func (c *Client) addJitter(d time.Duration) time.Duration {
 	jitter := float64(d) * RetryJitterFraction
 	offset := (c.rng.Float64() * 2 * jitter) - jitter
 	return d + time.Duration(offset)
 }
 
-// parseRetryAfter parsea el header Retry-After (segundos o HTTP-date)
+// parseRetryAfter parses the Retry-After HTTP header.
+// It supports both formats: seconds (e.g., "120") and HTTP-date.
+// Returns 0 if the header is empty or cannot be parsed.
 func (c *Client) parseRetryAfter(value string) time.Duration {
 	if value == "" {
 		return 0
 	}
 
-	// Intentar parsear como segundos
+	// Try parsing as seconds
 	if secs, err := strconv.Atoi(value); err == nil && secs > 0 {
 		return time.Duration(secs) * time.Second
 	}
 
-	// Intentar parsear como HTTP-date
+	// Try parsing as HTTP-date (RFC 7231)
 	if t, err := http.ParseTime(value); err == nil {
 		delay := time.Until(t)
 		if delay > 0 {
@@ -191,19 +220,20 @@ func (c *Client) parseRetryAfter(value string) time.Duration {
 	return 0
 }
 
-// isTemporaryNetError determina si un error de red es transitorio y vale la pena reintentar
+// isTemporaryNetError determines if a network error is transient and worth retrying.
+// It checks for timeout errors, temporary errors, and common transient error patterns.
 func isTemporaryNetError(err error) bool {
 	if err == nil {
 		return false
 	}
 
-	// Verificar si es un error de red con método Temporary()
+	// Check if it's a net.Error with Timeout() or Temporary() methods
 	var netErr net.Error
 	if ok := errors.As(err, &netErr); ok {
 		return netErr.Timeout() || netErr.Temporary()
 	}
 
-	// Verificar errores comunes transitorios por mensaje
+	// Check for common transient error patterns in error message
 	errStr := err.Error()
 	transientPatterns := []string{
 		"connection reset",
@@ -222,7 +252,9 @@ func isTemporaryNetError(err error) bool {
 	return false
 }
 
-// doRequest ejecuta una petición HTTP con headers, reintentos y rate limiting
+// doRequest executes an HTTP request with proper headers, retry logic, and rate limiting.
+// It handles transient network errors, HTTP status codes (429, 503, 529), and respects
+// context cancellation for graceful shutdown.
 func (c *Client) doRequest(ctx context.Context, endpoint string, params url.Values) ([]byte, error) {
 	reqURL := fmt.Sprintf("%s/%s", c.baseURL, endpoint)
 	if len(params) > 0 {
@@ -231,6 +263,7 @@ func (c *Client) doRequest(ctx context.Context, endpoint string, params url.Valu
 
 	var lastErr error
 	for attempt := 0; attempt <= MaxRetries; attempt++ {
+		// Check for context cancellation before each retry attempt
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -241,15 +274,15 @@ func (c *Client) doRequest(ctx context.Context, endpoint string, params url.Valu
 
 		req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 		if err != nil {
-			return nil, fmt.Errorf("error creando request: %w", err)
+			return nil, fmt.Errorf("error creating request: %w", err)
 		}
 
-		// Headers requeridos y recomendados
-		req.Header.Set("email", c.email)
-		req.Header.Set("User-Agent", c.userAgent)
-		req.Header.Set("Accept", "application/json")
+		// Set required and recommended headers
+		req.Header.Set("email", c.email)             // SSL Labs authentication
+		req.Header.Set("User-Agent", c.userAgent)    // Client identification
+		req.Header.Set("Accept", "application/json") // Expected response format
 
-		// Ejecutar request con reintentos para errores de red transitorios
+		// Execute request with retries for transient network errors
 		var resp *http.Response
 		var body []byte
 
@@ -259,14 +292,14 @@ func (c *Client) doRequest(ctx context.Context, endpoint string, params url.Valu
 				break
 			}
 
-			// Si es error transitorio y quedan reintentos, esperar y reintentar
+			// If transient error and retries remaining, wait and retry
 			if isTemporaryNetError(err) && netAttempt < MaxNetRetries {
 				delay := c.addJitter(NetRetryDelay)
-				lastErr = fmt.Errorf("error de red transitorio (intento %d/%d): %w", netAttempt+1, MaxNetRetries+1, err)
+				lastErr = fmt.Errorf("transient network error (attempt %d/%d): %w", netAttempt+1, MaxNetRetries+1, err)
 				if sleepErr := sleepWithContext(ctx, delay); sleepErr != nil {
 					return nil, sleepErr
 				}
-				// Recrear request ya que el anterior puede estar "usado"
+				// Recreate request as the previous one may be "used"
 				req, _ = http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 				req.Header.Set("email", c.email)
 				req.Header.Set("User-Agent", c.userAgent)
@@ -274,28 +307,28 @@ func (c *Client) doRequest(ctx context.Context, endpoint string, params url.Valu
 				continue
 			}
 
-			return nil, fmt.Errorf("error en la petición: %w", err)
+			return nil, fmt.Errorf("request error: %w", err)
 		}
 
 		if resp == nil {
 			if lastErr != nil {
 				return nil, lastErr
 			}
-			return nil, fmt.Errorf("error desconocido: respuesta nula")
+			return nil, fmt.Errorf("unknown error: nil response")
 		}
 
-		// Limitar lectura del body para evitar ataques de memoria
+		// Limit body reading to prevent memory exhaustion attacks
 		limitedReader := io.LimitReader(resp.Body, MaxBodySize+1)
 		body, err = io.ReadAll(limitedReader)
 		resp.Body.Close()
 		if err != nil {
-			return nil, fmt.Errorf("error leyendo respuesta: %w", err)
+			return nil, fmt.Errorf("error reading response: %w", err)
 		}
 		if len(body) > MaxBodySize {
-			return nil, fmt.Errorf("respuesta demasiado grande (>%d bytes)", MaxBodySize)
+			return nil, fmt.Errorf("response too large (>%d bytes)", MaxBodySize)
 		}
 
-		// Leer headers de rate limiting (thread-safe)
+		// Extract rate limiting headers (thread-safe update)
 		maxVal, currVal := -1, -1
 		if maxStr := resp.Header.Get("X-Max-Assessments"); maxStr != "" {
 			if max, err := strconv.Atoi(maxStr); err == nil {
@@ -309,19 +342,18 @@ func (c *Client) doRequest(ctx context.Context, endpoint string, params url.Valu
 		}
 		c.updateRateLimit(maxVal, currVal)
 
-		// Manejo de códigos según documentación
+		// Handle HTTP status codes according to API documentation
 		switch resp.StatusCode {
 		case http.StatusOK:
 			return body, nil
 
-		case http.StatusBadRequest:
+		case http.StatusBadRequest: // 400: Invalid parameters
 			return nil, c.parseAPIError(400, body)
 
-		case 429:
-			// 429: verificar Retry-After antes de fallar
+		case 429: // Too Many Requests: check Retry-After header
 			if attempt < MaxRetries {
 				if delay := c.parseRetryAfter(resp.Header.Get("Retry-After")); delay > 0 {
-					lastErr = fmt.Errorf("error 429: demasiadas peticiones, esperando %v", delay)
+					lastErr = fmt.Errorf("error 429: too many requests, waiting %v", delay)
 					if err := sleepWithContext(ctx, c.addJitter(delay)); err != nil {
 						return nil, err
 					}
@@ -330,42 +362,39 @@ func (c *Client) doRequest(ctx context.Context, endpoint string, params url.Valu
 			}
 			return nil, &APIError{
 				StatusCode: 429,
-				RawBody:    "demasiadas peticiones - reduzca la concurrencia y espere",
+				RawBody:    "too many requests - reduce concurrency and wait",
 			}
 
-		case 441:
+		case 441: // Not Authorized: email not registered
 			return nil, &APIError{
 				StatusCode: 441,
-				RawBody:    "no autorizado - debe registrarse primero en la API",
+				RawBody:    "not authorized - must register email first",
 			}
 
-		case http.StatusInternalServerError:
-			// 500: error severo, no reintentar en bucle
+		case http.StatusInternalServerError: // 500: Severe error, don't retry
 			return nil, &APIError{StatusCode: 500, RawBody: string(body)}
 
-		case http.StatusServiceUnavailable:
-			// 503: servicio no disponible, reintentar con delay largo
+		case http.StatusServiceUnavailable: // 503: Service unavailable, retry with delay
 			if attempt < MaxRetries {
 				delay := c.addJitter(RetryDelay503)
-				lastErr = fmt.Errorf("error 503: servicio no disponible, reintentando en %v", delay)
+				lastErr = fmt.Errorf("error 503: service unavailable, retrying in %v", delay)
 				if err := sleepWithContext(ctx, delay); err != nil {
 					return nil, err
 				}
 				continue
 			}
-			return nil, &APIError{StatusCode: 503, RawBody: "servicio no disponible tras reintentos"}
+			return nil, &APIError{StatusCode: 503, RawBody: "service unavailable after retries"}
 
-		case 529:
-			// 529: sobrecargado, reintentar con delay más largo
+		case 529: // Overloaded: retry with longer delay
 			if attempt < MaxRetries {
 				delay := c.addJitter(RetryDelay529)
-				lastErr = fmt.Errorf("error 529: servicio sobrecargado, reintentando en %v", delay)
+				lastErr = fmt.Errorf("error 529: service overloaded, retrying in %v", delay)
 				if err := sleepWithContext(ctx, delay); err != nil {
 					return nil, err
 				}
 				continue
 			}
-			return nil, &APIError{StatusCode: 529, RawBody: "servicio sobrecargado tras reintentos"}
+			return nil, &APIError{StatusCode: 529, RawBody: "service overloaded after retries"}
 
 		default:
 			return nil, &APIError{StatusCode: resp.StatusCode, RawBody: string(body)}
@@ -375,10 +404,10 @@ func (c *Client) doRequest(ctx context.Context, endpoint string, params url.Valu
 	if lastErr != nil {
 		return nil, lastErr
 	}
-	return nil, fmt.Errorf("error desconocido tras reintentos")
+	return nil, fmt.Errorf("unknown error after retries")
 }
 
-// parseAPIError parsea el cuerpo de error JSON a estructura
+// parseAPIError parses a JSON error response body into a structured APIError.
 func (c *Client) parseAPIError(statusCode int, body []byte) *APIError {
 	apiErr := &APIError{
 		StatusCode: statusCode,
@@ -393,7 +422,8 @@ func (c *Client) parseAPIError(statusCode int, body []byte) *APIError {
 	return apiErr
 }
 
-// Info obtiene información del servidor SSL Labs
+// Info retrieves information about the SSL Labs service and current capacity.
+// It calls the /info endpoint which does not require authentication.
 func (c *Client) Info(ctx context.Context) (*models.Info, error) {
 	body, err := c.doRequest(ctx, "info", nil)
 	if err != nil {
@@ -402,17 +432,18 @@ func (c *Client) Info(ctx context.Context) (*models.Info, error) {
 
 	var info models.Info
 	if err := json.Unmarshal(body, &info); err != nil {
-		return nil, fmt.Errorf("error parseando JSON: %w", err)
+		return nil, fmt.Errorf("error parsing JSON: %w", err)
 	}
 
 	return &info, nil
 }
 
-// Analyze inicia o consulta un análisis
+// Analyze initiates or retrieves an analysis for the specified host.
+// Set startNew to true to start a fresh analysis, false to check existing.
 func (c *Client) Analyze(ctx context.Context, host string, startNew bool) (*models.Host, error) {
 	params := url.Values{}
 	params.Set("host", host)
-	params.Set("all", "done") // Obtener detalles completos cuando esté listo
+	params.Set("all", "done") // Get complete details when ready
 
 	if startNew {
 		params.Set("startNew", "on")
@@ -425,57 +456,58 @@ func (c *Client) Analyze(ctx context.Context, host string, startNew bool) (*mode
 
 	var result models.Host
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("error parseando JSON: %w", err)
+		return nil, fmt.Errorf("error parsing JSON: %w", err)
 	}
 
 	return &result, nil
 }
 
-// AnalyzeWithPolling realiza un análisis completo con polling automático
-// Respeta context para cancelación y devuelve resultados parciales en caso de error
+// AnalyzeWithPolling performs a complete analysis with automatic polling.
+// It respects the context for cancellation and returns partial results on error.
+// The onProgress callback is called with status updates during polling.
 func (c *Client) AnalyzeWithPolling(ctx context.Context, host string, coolOff time.Duration, onProgress func(status, msg string)) (*models.Host, error) {
-	// Respetar cool-off antes de iniciar nuevo análisis
+	// Respect cool-off period before starting new analysis
 	if coolOff > 0 {
 		if err := sleepWithContext(ctx, coolOff); err != nil {
-			return nil, fmt.Errorf("cancelado durante cool-off: %w", err)
+			return nil, fmt.Errorf("cancelled during cool-off: %w", err)
 		}
 	}
 
-	// Iniciar nuevo análisis
+	// Start new analysis
 	result, err := c.Analyze(ctx, host, true)
 	if err != nil {
-		return nil, fmt.Errorf("error iniciando análisis: %w", err)
+		return nil, fmt.Errorf("error starting analysis: %w", err)
 	}
 
-	// Polling hasta que el análisis esté completo
+	// Poll until analysis is complete
 	for result.Status != models.StatusReady && result.Status != models.StatusError {
 		if onProgress != nil {
 			onProgress(result.Status, result.StatusMessage)
 		}
 
-		// Usar intervalo variable según documentación
+		// Use variable interval as recommended by documentation
 		pollInterval := InitialPollInterval
 		if result.Status == models.StatusInProgress {
 			pollInterval = ActivePollInterval
 		}
 
-		// Respetar contexto durante el sleep
+		// Respect context during sleep
 		if err := sleepWithContext(ctx, pollInterval); err != nil {
-			// Devolver resultado parcial en caso de cancelación
-			return result, fmt.Errorf("análisis cancelado: %w", err)
+			// Return partial result on cancellation
+			return result, fmt.Errorf("analysis cancelled: %w", err)
 		}
 
-		// Consultar estado (sin startNew para no reiniciar)
+		// Query status (without startNew to avoid restarting)
 		newResult, err := c.Analyze(ctx, host, false)
 		if err != nil {
-			// Devolver último resultado conocido junto con el error
-			return result, fmt.Errorf("error consultando estado: %w", err)
+			// Return last known result along with the error
+			return result, fmt.Errorf("error querying status: %w", err)
 		}
 		result = newResult
 	}
 
 	if result.Status == models.StatusError {
-		return result, fmt.Errorf("análisis terminó con error: %s", result.StatusMessage)
+		return result, fmt.Errorf("analysis completed with error: %s", result.StatusMessage)
 	}
 
 	return result, nil

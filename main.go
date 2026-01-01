@@ -1,15 +1,20 @@
 /*
-SSL Labs Scanner - Challenge Técnico
+SSL Labs Scanner - Technical Challenge
 
-Este programa analiza la seguridad TLS de un dominio usando la API pública
-de SSL Labs v4.
+This program analyzes the TLS security configuration of a domain using
+the SSL Labs public API v4. It displays the SSL grade, identifies critical
+vulnerabilities, and differentiates between exploitable and historical/mitigated issues.
 
-Uso:
+Usage:
 
-	go run main.go -email tu@empresa.com -host dominio.com
+	go run main.go -email your@company.com -host domain.com
 
-Requisitos:
-  - Email registrado previamente en SSL Labs (ver README.md)
+Requirements:
+  - Email must be pre-registered with SSL Labs (see README.md)
+  - No external dependencies (stdlib only)
+
+Author: Jose Martínez
+Con mucho cariño para el Semillero Nebula
 */
 package main
 
@@ -28,13 +33,15 @@ import (
 )
 
 // ============================================================================
-// ANSI Colors & Styles - Sin dependencias externas
+// ANSI Colors & Styles - No external dependencies required
 // ============================================================================
 
-// colorEnabled controla si se usan colores ANSI
+// colorEnabled controls whether ANSI escape codes are used for terminal output.
+// Set to false via --no-color flag or NO_COLOR environment variable.
 var colorEnabled = true
 
-// Códigos ANSI
+// ANSI escape codes for terminal text formatting.
+// Reference: https://en.wikipedia.org/wiki/ANSI_escape_code
 const (
 	ansiReset = "\033[0m"
 
@@ -60,7 +67,8 @@ const (
 	ansiBrightCyan   = "\033[96m"
 )
 
-// Símbolos Unicode (estos no dependen de colorEnabled)
+// Unicode symbols for visual indicators in output.
+// Note: These display regardless of colorEnabled setting.
 const (
 	symbolCheck   = "✓"
 	symbolCross   = "✗"
@@ -73,7 +81,8 @@ const (
 	symbolLine    = "─"
 )
 
-// Funciones que devuelven códigos solo si colorEnabled
+// Color accessor functions - return ANSI codes only when colorEnabled is true.
+// This pattern allows graceful degradation when output is piped or redirected.
 func reset() string {
 	if colorEnabled {
 		return ansiReset
@@ -153,7 +162,8 @@ func brightCyan() string {
 	return ""
 }
 
-// style aplica estilos ANSI a un texto
+// style applies multiple ANSI style codes to a text string.
+// Returns plain text if colorEnabled is false.
 func style(text string, styles ...string) string {
 	if !colorEnabled || len(styles) == 0 {
 		return text
@@ -162,56 +172,57 @@ func style(text string, styles ...string) string {
 	return prefix + text + ansiReset
 }
 
-// Helpers para estilos comunes
+// Semantic style helpers for common message types.
+// These provide consistent coloring throughout the application.
 func success(text string) string  { return style(text, green()) }
-func successB(text string) string { return style(text, bold(), green()) }
+func successB(text string) string { return style(text, bold(), green()) } // Bold success
 func warning(text string) string  { return style(text, yellow()) }
-func warningB(text string) string { return style(text, bold(), yellow()) }
+func warningB(text string) string { return style(text, bold(), yellow()) } // Bold warning
 func danger(text string) string   { return style(text, red()) }
-func dangerB(text string) string  { return style(text, bold(), red()) }
+func dangerB(text string) string  { return style(text, bold(), red()) } // Bold danger
 func info(text string) string     { return style(text, cyan()) }
-func infoB(text string) string    { return style(text, bold(), cyan()) }
-func muted(text string) string    { return style(text, gray()) }
+func infoB(text string) string    { return style(text, bold(), cyan()) } // Bold info
+func muted(text string) string    { return style(text, gray()) }         // Dimmed/secondary text
 func header(text string) string   { return style(text, bold(), brightCyan()) }
-func label(text string) string    { return style(text, dim()) }
+func label(text string) string    { return style(text, dim()) } // Field labels
 
-// line genera una línea decorativa
+// line generates a decorative horizontal line of specified length.
 func line(length int) string {
 	return muted(strings.Repeat(symbolLine, length))
 }
 
 // ============================================================================
-// Main
+// Main - Application entry point
 // ============================================================================
 
 func main() {
-	// Parsear argumentos de línea de comandos
-	emailFlag := flag.String("email", "", "Email registrado en SSL Labs (o usar SSLLABS_EMAIL env var)")
-	host := flag.String("host", "", "Dominio a analizar (obligatorio)")
-	timeout := flag.Duration("timeout", 10*time.Minute, "Timeout máximo para el análisis")
-	noColor := flag.Bool("no-color", false, "Desactivar colores en la salida")
+	// Parse command-line flags
+	emailFlag := flag.String("email", "", "Email registered with SSL Labs (or use SSLLABS_EMAIL env var)")
+	host := flag.String("host", "", "Domain to analyze (required)")
+	timeout := flag.Duration("timeout", 10*time.Minute, "Maximum timeout for the analysis")
+	noColor := flag.Bool("no-color", false, "Disable colored output")
 	flag.Parse()
 
-	// Desactivar colores si se solicita o si no es terminal
+	// Disable colors if requested or if not running in a terminal
 	if *noColor || os.Getenv("NO_COLOR") != "" {
 		disableColors()
 	}
 
-	// Email: prioridad flag > variable de entorno
+	// Email priority: command-line flag > environment variable
 	email := *emailFlag
 	if email == "" {
 		email = os.Getenv("SSLLABS_EMAIL")
 	}
 
-	// Validar argumentos
+	// Validate required arguments
 	if email == "" || *host == "" {
-		fmt.Println(dangerB("Error: ") + "Se requieren los parámetros " + info("-email") + " (o " + info("SSLLABS_EMAIL") + ") y " + info("-host"))
+		fmt.Println(dangerB("Error: ") + "Required parameters: " + info("-email") + " (or " + info("SSLLABS_EMAIL") + ") and " + info("-host"))
 		fmt.Println()
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	// Validar email (advertencia si usa dominio gratuito)
+	// Validate email format (warn if using free email provider)
 	if warnings := client.ValidateEmail(email); len(warnings) > 0 {
 		for _, w := range warnings {
 			fmt.Println(warningB(symbolWarning+" ") + w)
@@ -219,28 +230,28 @@ func main() {
 		fmt.Println()
 	}
 
-	// Crear contexto con cancelación (Ctrl+C) y timeout
+	// Create context with cancellation (Ctrl+C) and timeout
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
-	// Manejar señales de interrupción
+	// Handle interrupt signals (Ctrl+C, SIGTERM) for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigChan
 		fmt.Println()
-		fmt.Println(warningB(symbolWarning + " Cancelando análisis..."))
+		fmt.Println(warningB(symbolWarning + " Cancelling analysis..."))
 		cancel()
 	}()
 
-	// Crear cliente
+	// Create SSL Labs client
 	c := client.New(email)
 
-	// Banner
+	// Display application banner
 	printBanner()
 
-	// Verificar disponibilidad de la API
-	fmt.Println(info(symbolArrow) + " Verificando disponibilidad de SSL Labs...")
+	// Verify SSL Labs API availability
+	fmt.Println(info(symbolArrow) + " Checking SSL Labs availability...")
 
 	apiInfo, err := c.Info(ctx)
 	if err != nil {
@@ -248,20 +259,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Println(successB(symbolCheck) + " SSL Labs " + success("disponible"))
+	fmt.Println(successB(symbolCheck) + " SSL Labs " + success("available"))
 	fmt.Println(muted("  Engine: "+apiInfo.EngineVersion) + muted(" │ Criteria: "+apiInfo.CriteriaVersion))
 	fmt.Println(muted(fmt.Sprintf("  Assessments: %d/%d", apiInfo.CurrentAssessments, apiInfo.MaxAssessments)))
 
-	// Mostrar cool-off si existe
+	// Display cool-off period if applicable
 	coolOff := time.Duration(apiInfo.NewAssessmentCoolOff) * time.Millisecond
 	if coolOff > 0 {
 		fmt.Println(muted(fmt.Sprintf("  Cool-off: %v", coolOff)))
 	}
 	fmt.Println()
 
-	// Iniciar análisis con polling
-	fmt.Println(header(symbolDot+" Analizando: ") + infoB(*host))
-	fmt.Println(muted("  (Esto puede tomar varios minutos... Ctrl+C para cancelar)"))
+	// Start analysis with polling
+	fmt.Println(header(symbolDot+" Analyzing: ") + infoB(*host))
+	fmt.Println(muted("  (This may take several minutes... Ctrl+C to cancel)"))
 	fmt.Println()
 
 	result, err := c.AnalyzeWithPolling(ctx, *host, coolOff, func(status, msg string) {
@@ -269,7 +280,7 @@ func main() {
 		fmt.Printf("  %s %s\n", style("["+status+"]", statusColor), muted(msg))
 	})
 
-	// Mostrar información de rate limiting actualizada
+	// Display updated rate limiting information
 	rateLimit := c.GetRateLimitInfo()
 	if rateLimit.MaxAssessments > 0 {
 		fmt.Println()
@@ -280,25 +291,25 @@ func main() {
 	if err != nil {
 		fmt.Println()
 		fmt.Println(dangerB(symbolCross+" Error: ") + fmt.Sprintf("%v", err))
-		// Si hay resultados parciales, mostrarlos
+		// If partial results exist, display them
 		if result != nil && len(result.Endpoints) > 0 {
 			fmt.Println()
-			fmt.Println(warningB("═══ RESULTADOS PARCIALES ═══"))
+			fmt.Println(warningB("═══ PARTIAL RESULTS ═══"))
 			printResults(result)
 		}
 		os.Exit(1)
 	}
 
-	// Mostrar resultados
+	// Display final results
 	fmt.Println()
 	printResults(result)
 }
 
 // ============================================================================
-// Output Functions
+// Output Functions - Display formatting for analysis results
 // ============================================================================
 
-// printBanner imprime el banner del programa
+// printBanner displays the application header/banner.
 func printBanner() {
 	fmt.Println()
 	fmt.Println(header("╔══════════════════════════════════════╗"))
@@ -308,7 +319,7 @@ func printBanner() {
 	fmt.Println()
 }
 
-// getStatusColor devuelve el color apropiado para un status
+// getStatusColor returns the appropriate ANSI color code for a given status.
 func getStatusColor(status string) string {
 	switch status {
 	case "READY":
@@ -324,22 +335,22 @@ func getStatusColor(status string) string {
 	}
 }
 
-// printResults muestra los resultados del análisis
+// printResults displays the complete analysis results with formatting.
 func printResults(result *models.Host) {
 	fmt.Println(header("╔══════════════════════════════════════╗"))
-	fmt.Println(header("║") + "           " + style("RESULTADOS", bold(), white()) + "              " + header("║"))
+	fmt.Println(header("║") + "           " + style("RESULTS", bold(), white()) + "                 " + header("║"))
 	fmt.Println(header("╚══════════════════════════════════════╝"))
 	fmt.Println()
 
-	// Información del host
-	fmt.Println(label("  Dominio: ") + infoB(result.Host))
+	// Host information
+	fmt.Println(label("  Domain: ") + infoB(result.Host))
 	if result.Port > 0 {
-		fmt.Println(label("  Puerto:  ") + info(fmt.Sprintf("%d", result.Port)))
+		fmt.Println(label("  Port:   ") + info(fmt.Sprintf("%d", result.Port)))
 	}
 	fmt.Println()
 
 	if len(result.Endpoints) == 0 {
-		fmt.Println(warning("  No se encontraron endpoints para analizar."))
+		fmt.Println(warning("  No endpoints found to analyze."))
 		return
 	}
 
@@ -348,43 +359,43 @@ func printResults(result *models.Host) {
 	}
 }
 
-// printEndpoint imprime información de un endpoint
+// printEndpoint displays detailed information for a single endpoint.
 func printEndpoint(num int, endpoint models.Endpoint) {
 	fmt.Println(line(42))
 	fmt.Println(style(fmt.Sprintf("  %s Endpoint %d", symbolBox, num), bold()))
 	fmt.Println(line(42))
 	fmt.Println()
 
-	// IP y servidor
+	// IP and server name
 	fmt.Println(label("  IP:     ") + info(endpoint.IPAddress))
 	if endpoint.ServerName != "" {
 		fmt.Println(label("  Server: ") + muted(endpoint.ServerName))
 	}
 	fmt.Println()
 
-	// Grade - la parte más importante
+	// Grade - the most important metric
 	printGrade(endpoint.Grade)
 
 	if endpoint.GradeTrustIgnored != "" && endpoint.GradeTrustIgnored != endpoint.Grade {
-		fmt.Println(label("  Grade (ignorando trust): ") + formatGradeCompact(endpoint.GradeTrustIgnored))
+		fmt.Println(label("  Grade (ignoring trust): ") + formatGradeCompact(endpoint.GradeTrustIgnored))
 	}
 
 	if endpoint.FutureGrade != "" {
 		fmt.Println(label("  Future Grade: ") + formatGradeCompact(endpoint.FutureGrade))
 	}
 
-	// Warnings y excepciones
+	// Warnings and exceptional status
 	if endpoint.HasWarnings {
 		fmt.Println()
-		fmt.Println(warningB("  "+symbolWarning+" Advertencias") + warning(" que pueden afectar el score"))
+		fmt.Println(warningB("  "+symbolWarning+" Warnings") + warning(" that may affect the score"))
 	}
 
 	if endpoint.IsExceptional {
 		fmt.Println()
-		fmt.Println(style("  "+symbolStar+" Configuración excepcional", bold(), brightGreen()))
+		fmt.Println(style("  "+symbolStar+" Exceptional configuration", bold(), brightGreen()))
 	}
 
-	// Vulnerabilidades
+	// Vulnerability assessment
 	if endpoint.Details != nil {
 		fmt.Println()
 		printVulnerabilities(endpoint.Details)
@@ -393,10 +404,11 @@ func printEndpoint(num int, endpoint models.Endpoint) {
 	fmt.Println()
 }
 
-// printGrade imprime el grade con formato visual destacado
+// printGrade displays the security grade with prominent visual formatting.
+// Grades range from A+ (best) to F (worst), with T for trust issues and M for certificate mismatch.
 func printGrade(grade string) {
 	if grade == "" {
-		fmt.Println(label("  Grade:  ") + muted("(pendiente)"))
+		fmt.Println(label("  Grade:  ") + muted("(pending)"))
 		return
 	}
 
@@ -406,43 +418,43 @@ func printGrade(grade string) {
 	case grade == "A+":
 		gradeStyle = style(grade, bold(), brightGreen())
 		symbol = style(symbolStar, brightGreen())
-		status = success("Excelente")
+		status = success("Excellent")
 	case grade == "A":
 		gradeStyle = style(grade, bold(), green())
 		symbol = style(symbolCheck, green())
-		status = success("Muy bueno")
+		status = success("Very Good")
 	case grade == "A-":
 		gradeStyle = style(grade, bold(), green())
 		symbol = style(symbolCheck, green())
-		status = success("Bueno")
+		status = success("Good")
 	case grade == "B":
 		gradeStyle = style(grade, bold(), yellow())
 		symbol = style(symbolCircle, yellow())
-		status = warning("Aceptable")
+		status = warning("Acceptable")
 	case grade == "C":
 		gradeStyle = style(grade, bold(), yellow())
 		symbol = style(symbolWarning, yellow())
-		status = warning("Mejorable")
+		status = warning("Needs Improvement")
 	case grade == "D" || grade == "E":
 		gradeStyle = style(grade, bold(), red())
 		symbol = style(symbolWarning, red())
-		status = danger("Inseguro")
+		status = danger("Insecure")
 	case grade == "F":
 		gradeStyle = style(grade, bold(), brightRed())
 		symbol = style(symbolCross, brightRed())
-		status = dangerB("Crítico")
+		status = dangerB("Critical")
 	case grade == "T":
 		gradeStyle = style(grade, bold(), red())
 		symbol = style(symbolCross, red())
-		status = danger("Sin confianza")
+		status = danger("Not Trusted")
 	case grade == "M":
 		gradeStyle = style(grade, bold(), red())
 		symbol = style(symbolWarning, red())
-		status = danger("Mismatch certificado")
+		status = danger("Certificate Mismatch")
 	default:
 		gradeStyle = style(grade, bold())
 		symbol = "?"
-		status = muted("Desconocido")
+		status = muted("Unknown")
 	}
 
 	fmt.Println()
@@ -453,7 +465,8 @@ func printGrade(grade string) {
 	fmt.Println()
 }
 
-// formatGradeCompact devuelve el grade con color pero sin caja
+// formatGradeCompact returns a colored grade string without the decorative box.
+// Used for secondary grade displays (trust-ignored, future grade).
 func formatGradeCompact(grade string) string {
 	switch {
 	case strings.HasPrefix(grade, "A"):
@@ -471,32 +484,35 @@ func formatGradeCompact(grade string) string {
 	}
 }
 
-// printVulnerabilities muestra el resumen de vulnerabilidades
-// Separamos en CRÍTICAS (exploits activos) vs INFORMATIVAS (históricas/mitigadas)
+// printVulnerabilities displays the vulnerability assessment results.
+// Separates CRITICAL vulnerabilities (active exploits requiring action) from
+// INFORMATIONAL ones (historical or mitigated in modern environments).
 func printVulnerabilities(details *models.EndpointDetails) {
 	// ═══════════════════════════════════════════════════════════════════════
-	// VULNERABILIDADES CRÍTICAS - Exploits reales que requieren acción
+	// CRITICAL VULNERABILITIES - Active exploits requiring immediate action
 	// ═══════════════════════════════════════════════════════════════════════
-	fmt.Println(style("  Vulnerabilidades Críticas", bold(), underline()))
+	fmt.Println(style("  Critical Vulnerabilities", bold(), underline()))
 	fmt.Println()
 
+	// Boolean-based critical vulnerabilities
 	criticalVulns := []struct {
 		name       string
 		vulnerable bool
 	}{
-		{"Heartbleed", details.Heartbleed}, // CVE-2014-0160 - Memory disclosure
-		{"DROWN", details.DrownVulnerable}, // CVE-2016-0800 - Cross-protocol attack
+		{"Heartbleed", details.Heartbleed}, // CVE-2014-0160 - OpenSSL memory disclosure
+		{"DROWN", details.DrownVulnerable}, // CVE-2016-0800 - Cross-protocol attack via SSLv2
 	}
 
+	// Integer-based critical vulnerabilities (threshold indicates vulnerability)
 	criticalNumeric := []struct {
 		name      string
 		value     int
 		threshold int
 	}{
-		{"ROBOT", details.Bleichenbacher, 2},               // Return Of Bleichenbacher Oracle
-		{"OpenSSL CCS", details.OpenSslCcs, 2},             // CVE-2014-0224
-		{"Lucky Minus 20", details.OpenSSLLuckyMinus20, 2}, // CVE-2016-2107
-		{"Ticketbleed", details.Ticketbleed, 2},            // CVE-2016-9244
+		{"ROBOT", details.Bleichenbacher, 2},               // Return Of Bleichenbacher's Oracle Threat
+		{"OpenSSL CCS", details.OpenSslCcs, 2},             // CVE-2014-0224 - CCS Injection
+		{"Lucky Minus 20", details.OpenSSLLuckyMinus20, 2}, // CVE-2016-2107 - Padding oracle
+		{"Ticketbleed", details.Ticketbleed, 2},            // CVE-2016-9244 - Session ticket leak
 	}
 
 	hasCritical := false
@@ -506,7 +522,7 @@ func printVulnerabilities(details *models.EndpointDetails) {
 			fmt.Printf("  %s %-16s %s\n", dangerB(symbolCross), v.name, dangerB("VULNERABLE"))
 			hasCritical = true
 		} else {
-			fmt.Printf("  %s %-16s %s\n", success(symbolCheck), v.name, muted("Seguro"))
+			fmt.Printf("  %s %-16s %s\n", success(symbolCheck), v.name, muted("Secure"))
 		}
 	}
 
@@ -515,67 +531,69 @@ func printVulnerabilities(details *models.EndpointDetails) {
 			fmt.Printf("  %s %-16s %s\n", dangerB(symbolCross), v.name, dangerB("VULNERABLE"))
 			hasCritical = true
 		} else {
-			fmt.Printf("  %s %-16s %s\n", success(symbolCheck), v.name, muted("Seguro"))
+			fmt.Printf("  %s %-16s %s\n", success(symbolCheck), v.name, muted("Secure"))
 		}
 	}
 
 	fmt.Println()
 	if hasCritical {
-		fmt.Println(style("  "+symbolCross+" CRÍTICO: Vulnerabilidades explotables detectadas", bold(), brightRed()))
+		fmt.Println(style("  "+symbolCross+" CRITICAL: Exploitable vulnerabilities detected", bold(), brightRed()))
 	} else {
-		fmt.Println(style("  "+symbolCheck+" Sin vulnerabilidades críticas", bold(), green()))
+		fmt.Println(style("  "+symbolCheck+" No critical vulnerabilities found", bold(), green()))
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════
-	// VULNERABILIDADES INFORMATIVAS - Históricas o típicamente mitigadas
+	// INFORMATIONAL VULNERABILITIES - Historical or typically mitigated
 	// ═══════════════════════════════════════════════════════════════════════
 	fmt.Println()
-	fmt.Println(style("  Información Adicional", bold(), dim()))
-	fmt.Println(muted("  (Históricas o mitigadas en navegadores modernos)"))
+	fmt.Println(style("  Additional Information", bold(), dim()))
+	fmt.Println(muted("  (Historical or mitigated in modern browsers)"))
 	fmt.Println()
 
-	// BEAST, POODLE, FREAK, Logjam son históricas - mitigadas en TLS 1.1+
-	// y en todos los navegadores modernos (client-side mitigation)
+	// BEAST, POODLE, FREAK, Logjam are historical vulnerabilities.
+	// These are mitigated in TLS 1.1+ and all modern browsers via client-side protections.
 	infoVulns := []struct {
 		name     string
 		detected bool
 		note     string
 	}{
-		{"BEAST", details.VulnBeast, "Mitigado en TLS 1.1+ y navegadores"},
-		{"POODLE (SSL3)", details.Poodle, "SSL 3.0 deprecado"},
-		{"FREAK", details.Freak, "Export ciphers obsoletos"},
-		{"Logjam", details.Logjam, "DHE débil"},
+		{"BEAST", details.VulnBeast, "Mitigated in TLS 1.1+ and browsers"},
+		{"POODLE (SSL3)", details.Poodle, "SSL 3.0 deprecated"},
+		{"FREAK", details.Freak, "Export ciphers obsolete"},
+		{"Logjam", details.Logjam, "Weak DHE parameters"},
 	}
 
+	// Numeric informational vulnerabilities (CBC-related variants)
 	infoNumeric := []struct {
 		name      string
 		value     int
 		threshold int
 		note      string
 	}{
-		{"Zombie POODLE", details.ZombiePoodle, 2, "Variante CBC"},
-		{"GOLDENDOODLE", details.GoldenDoodle, 4, "Variante CBC"},
-		{"Sleeping POODLE", details.SleepingPoodle, 10, "Variante CBC"},
+		{"Zombie POODLE", details.ZombiePoodle, 2, "CBC variant"},
+		{"GOLDENDOODLE", details.GoldenDoodle, 4, "CBC variant"},
+		{"Sleeping POODLE", details.SleepingPoodle, 10, "CBC variant"},
 	}
 
 	for _, v := range infoVulns {
 		if v.detected {
-			fmt.Printf("  %s %-16s %s %s\n", warning(symbolWarning), v.name, warning("Detectado"), muted("- "+v.note))
+			fmt.Printf("  %s %-16s %s %s\n", warning(symbolWarning), v.name, warning("Detected"), muted("- "+v.note))
 		} else {
-			fmt.Printf("  %s %-16s %s\n", muted(symbolCircle), v.name, muted("No detectado"))
+			fmt.Printf("  %s %-16s %s\n", muted(symbolCircle), v.name, muted("Not detected"))
 		}
 	}
 
 	for _, v := range infoNumeric {
 		if v.value >= v.threshold {
-			fmt.Printf("  %s %-16s %s %s\n", warning(symbolWarning), v.name, warning("Detectado"), muted("- "+v.note))
+			fmt.Printf("  %s %-16s %s %s\n", warning(symbolWarning), v.name, warning("Detected"), muted("- "+v.note))
 		} else {
-			fmt.Printf("  %s %-16s %s\n", muted(symbolCircle), v.name, muted("No detectado"))
+			fmt.Printf("  %s %-16s %s\n", muted(symbolCircle), v.name, muted("Not detected"))
 		}
 	}
 }
 
-// disableColors desactiva todos los colores (para pipes o --no-color)
+// disableColors turns off all ANSI color output.
+// Called when --no-color flag is set or NO_COLOR environment variable exists.
 func disableColors() {
 	colorEnabled = false
 }
